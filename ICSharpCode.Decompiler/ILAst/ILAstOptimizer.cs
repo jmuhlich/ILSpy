@@ -36,6 +36,7 @@ namespace ICSharpCode.Decompiler.ILAst {
 		ConvertFieldAccessesToPropertyMethodCalls,
 		YieldReturn,
 		AsyncAwait,
+		RemoveKspObfuscations,
 		PropertyAccessInstructions,
 		SplitToMovableBlocks,
 		TypeInference,
@@ -239,6 +240,9 @@ namespace ICSharpCode.Decompiler.ILAst {
 
 				if (abortBeforeStep == ILAstOptimizationStep.AsyncAwait) return;
 				yrd?.RunStep2(context, method, out asyncInfo, Optimize_List_ILExpression, Optimize_List_ILBlock, Optimize_Dict_ILLabel_Int32, Optimize_List_ILNode, del_getILInlining);
+
+				if (abortBeforeStep == ILAstOptimizationStep.RemoveKspObfuscations) return;
+				RemoveKspObfuscations(method);
 
 				if (abortBeforeStep == ILAstOptimizationStep.PropertyAccessInstructions) return;
 				IntroducePropertyAccessInstructions(method);
@@ -1554,7 +1558,68 @@ namespace ICSharpCode.Decompiler.ILAst {
 				}
 			}
 		}
-		
+
+		/// <summary>
+		/// Strips simple dead-code obfuscations seen in KSP game code.
+		/// </summary>
+		void RemoveKspObfuscations(ILBlock block)
+		{
+			var toDrop = new HashSet<ILNode>();
+
+			/// Never-taken infinite switch loop
+			///   ldc.i4.?      ; (A) Immediate value must be != 0
+			///   switch (-10)  ; (B) The single target is the previous ldc
+			for (int i = 0; i < block.Body.Count - 1; i++) {
+				// At this step in the decompilation we're looking for a Label followed by a
+				// Switch. The Ldc will be inlined as the Switch's sole Argument.
+				var label = block.Body[i] as ILLabel;
+				if (label == null) { continue; }
+				ILLabel[] targets;
+				ILExpression arg;
+				if (!block.Body[i+1].Match(ILCode.Switch, out targets, out arg)) { continue; }
+				int v;
+				if (!arg.Match(ILCode.Ldc_I4, out v) || v == 0) { continue; } // (A)
+				if (targets.Count() != 1 || targets[0] != label) { continue; } // (B)
+				// Drop Switch.
+				toDrop.Add(block.Body[i+1]);
+			}
+
+			/// Dead ldtoken
+			///   ldc.i4.1      ; (A) Immediate value is always 1
+			///   brtrue.s +6   ; (B) This jumps just past the pop
+			///   ldtoken ?     ; Operand could be anything but seems to always be the current method
+			///   pop           ; Balances the stack in theory even though it would never be executed
+			for (int i = 0; i < block.Body.Count - 3; i++) {
+				// We're looking for Brtrue, Stloc, Label. The Ldc is inlined as the Brtrue's
+				// Argument, and The Ldtoken has become the Stloc's Argument. The final Pop
+				// was optimized out in a previous pass.
+				ILLabel target;
+				ILVariable locVar; // Ignored, just needed for the pattern match.
+				ILExpression branchArg, storeArg;
+				if (!block.Body[i].Match(ILCode.Brtrue, out target, out branchArg)) { continue; }
+				if (!block.Body[i+1].Match(ILCode.Stloc, out locVar, out storeArg)) { continue; }
+				var label = block.Body[i+2] as ILLabel;
+				if (label == null) { continue; }
+				int v;
+				if (!branchArg.Match(ILCode.Ldc_I4, out v) || v != 1) { continue; } // (A)
+				if (!storeArg.Match(ILCode.Ldtoken)) { continue; }
+				if (target != label) { continue; } // (B)
+				// Drop Brtrue and Stloc.
+				toDrop.Add(block.Body[i]);
+				toDrop.Add(block.Body[i+1]);
+			}
+
+			if (toDrop.Count > 0) {
+				var newBody = new List<ILNode>(block.Body.Count - toDrop.Count);
+				foreach (var node in block.Body) {
+					if (!toDrop.Contains(node)) {
+						newBody.Add(node);
+					}
+				}
+				block.Body = newBody;
+			}
+		}
+
 		/// <summary>
 		/// Converts call and callvirt instructions that read/write properties into CallGetter/CallSetter instructions.
 		/// 
